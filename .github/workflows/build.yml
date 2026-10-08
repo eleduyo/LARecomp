@@ -3,6 +3,9 @@ name: Build LARecomp
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: windows-latest
@@ -13,47 +16,99 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Install LLVM
+      - name: Install LLVM 20
         uses: KyleMayes/install-llvm-action@v2
         with:
           version: "20"
-          directory: ${{ runner.temp }}/llvm
+          directory: \${{ runner.temp }}/llvm
 
-      - name: Install Ninja
-        run: choco install ninja -y
-
-      - name: Install CMake
-        uses: lukka/get-cmake@latest
-
-      - name: Clone ReXGlue SDK
+      - name: Install CMake and Ninja
         shell: pwsh
         run: |
-          git clone --recursive https://github.com/rexglue/rexglue-sdk.git "$env:RUNNER_TEMP/rexglue-sdk"
+          choco install ninja -y
+          cmake --version
+          ninja --version
 
-      - name: Build ReXGlue SDK
+      - name: Download ReXGlue SDK 0.10.0
         shell: pwsh
         run: |
-          cmake -S "$env:RUNNER_TEMP/rexglue-sdk" `
-            -B "$env:RUNNER_TEMP/rexglue-build" `
-            -G Ninja `
-            -DCMAKE_BUILD_TYPE=Release `
-            -DCMAKE_CXX_FLAGS="-mssse3"
+          $url = "https://github.com/rexglue/rexglue-sdk/releases/download/v0.10.0/rexglue-sdk-0.10.0-win-amd64.zip"
+          $zip = "$env:RUNNER_TEMP\rexglue-sdk.zip"
+          Invoke-WebRequest -Uri $url -OutFile $zip
 
-          cmake --build "$env:RUNNER_TEMP/rexglue-build" --target install
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          if ($hash -ne "ad4485da853fbe932e9f5dbb643f9b5fe85dc73775ebbad4df6879fe6df0c11b") {
+            throw "ReXGlue SDK checksum mismatch: $hash"
+          }
+
+          $sdk = "$env:RUNNER_TEMP\rexglue-sdk"
+          Remove-Item $sdk -Recurse -Force -ErrorAction SilentlyContinue
+          Expand-Archive $zip -DestinationPath $sdk -Force
+
+          $rexglue = Get-ChildItem $sdk -Filter rexglue.exe -Recurse | Select-Object -First 1
+          if (-not $rexglue) {
+            throw "rexglue.exe was not found in the SDK package."
+          }
+
+          "REXGLUE_EXE=$($rexglue.FullName)" >> $env:GITHUB_ENV
+          "CMAKE_PREFIX_PATH=$sdk" >> $env:GITHUB_ENV
+          "$($rexglue.Directory.FullName)" >> $env:GITHUB_PATH
+
+      - name: Prepare LARecomp generated SDK files
+        shell: pwsh
+        run: |
+          & "$env:REXGLUE_EXE" migrate --app_root "$PWD" --force
+          if (-not (Test-Path "generated\rexglue.cmake")) {
+            throw "generated/rexglue.cmake was not created."
+          }
+
+      - name: Download your own game XEX
+        shell: pwsh
+        env:
+          GH_TOKEN: \${{ secrets.GAME_DATA_TOKEN }}
+        run: |
+          if (-not $env:GH_TOKEN) {
+            throw "Missing GAME_DATA_TOKEN. Create the private game-data repository and add a read-only token as a repository secret."
+          }
+
+          New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\game-input" | Out-Null
+
+          gh release download mcla --repo eleduyo/MCLA-GameData --pattern "default.xex" --dir "$env:RUNNER_TEMP\game-input"
+
+          if (-not (Test-Path "$env:RUNNER_TEMP\game-input\default.xex")) {
+            throw "default.xex was not downloaded."
+          }
+
+      - name: Run LARecomp codegen
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "out\build\win-amd64-release\assets" | Out-Null
+          Copy-Item "$env:RUNNER_TEMP\game-input\default.xex" "out\build\win-amd64-release\assets\default.xex" -Force
+
+          & "$env:REXGLUE_EXE" codegen larecomp_manifest.toml
+
+          if (-not (Test-Path "generated\sources.cmake")) {
+            throw "Codegen did not create generated/sources.cmake."
+          }
 
       - name: Configure LARecomp
         shell: pwsh
         run: |
-          cmake --preset win-amd64-relwithdebinfo .
+          cmake --preset win-amd64-release -DCMAKE_PREFIX_PATH="$env:CMAKE_PREFIX_PATH"
 
       - name: Build LARecomp
         shell: pwsh
         run: |
-          cmake --build out/build/win-amd64-relwithdebinfo
+          cmake --build out/build/win-amd64-release
+
+      - name: Package LARecomp
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "out\build\win-amd64-release\*" -DestinationPath "$env:RUNNER_TEMP\LARecomp-win64.zip" -Force
 
       - name: Upload LARecomp
         uses: actions/upload-artifact@v4
         with:
-          name: LARecomp
-          path: |
-            out/build/win-amd64-relwithdebinfo/**
+          name: LARecomp-win64
+          path: \${{ runner.temp }}/LARecomp-win64.zip
+          if-no-files-found: error
