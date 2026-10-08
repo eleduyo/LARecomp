@@ -1,0 +1,58 @@
+name: Build LARecomp
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout LARecomp
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install LLVM
+        uses: KyleMayes/install-llvm-action@v2
+        with:
+          version: "20"
+          directory: ${{ runner.temp }}/llvm
+
+      - name: Install Ninja
+        run: choco install ninja -y
+
+      - name: Install CMake
+        uses: lukka/get-cmake@latest
+
+      - name: Clone ReXGlue SDK
+        shell: pwsh
+        run: |
+          git clone --recursive https://github.com/rexglue/rexglue-sdk.git "$env:RUNNER_TEMP/rexglue-sdk"
+
+      - name: Build ReXGlue SDK
+        shell: pwsh
+        run: |
+          cmake -S "$env:RUNNER_TEMP/rexglue-sdk" `
+            -B "$env:RUNNER_TEMP/rexglue-build" `
+            -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release
+
+          cmake --build "$env:RUNNER_TEMP/rexglue-build" --target install
+
+      - name: Configure LARecomp
+        shell: pwsh
+        run: |
+          cmake --preset win-amd64-relwithdebinfo .
+
+      - name: Build LARecomp
+        shell: pwsh
+        run: |
+          cmake --build out/build/win-amd64-relwithdebinfo
+
+      - name: Upload LARecomp
+        uses: actions/upload-artifact@v4
+        with:
+          name: LARecomp
+          path: |
+            out/build/win-amd64-relwithdebinfo/**
