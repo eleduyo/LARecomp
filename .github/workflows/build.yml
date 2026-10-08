@@ -16,99 +16,151 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Install LLVM 20
-        uses: KyleMayes/install-llvm-action@v2
-        with:
-          version: "20"
-          directory: \${{ runner.temp }}/llvm
-
-      - name: Install CMake and Ninja
+      - name: Install toolchain
         shell: pwsh
         run: |
-          choco install ninja -y
+          choco install llvm cmake ninja -y
+          clang++ --version
           cmake --version
           ninja --version
 
       - name: Download ReXGlue SDK 0.10.0
         shell: pwsh
         run: |
-          $url = "https://github.com/rexglue/rexglue-sdk/releases/download/v0.10.0/rexglue-sdk-0.10.0-win-amd64.zip"
-          $zip = "$env:RUNNER_TEMP\rexglue-sdk.zip"
+          $url = 'https://github.com/rexglue/rexglue-sdk/releases/download/v0.10.0/rexglue-sdk-0.10.0-win-amd64.zip'
+          $zip = Join-Path $env:RUNNER_TEMP 'rexglue-sdk.zip'
+          $sdk = Join-Path $env:RUNNER_TEMP 'rexglue-sdk'
           Invoke-WebRequest -Uri $url -OutFile $zip
 
           $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
-          if ($hash -ne "ad4485da853fbe932e9f5dbb643f9b5fe85dc73775ebbad4df6879fe6df0c11b") {
+          if ($hash -ne 'ad4485da853fbe932e9f5dbb643f9b5fe85dc73775ebbad4df6879fe6df0c11b') {
             throw "ReXGlue SDK checksum mismatch: $hash"
           }
 
-          $sdk = "$env:RUNNER_TEMP\rexglue-sdk"
           Remove-Item $sdk -Recurse -Force -ErrorAction SilentlyContinue
           Expand-Archive $zip -DestinationPath $sdk -Force
 
-          $rexglue = Get-ChildItem $sdk -Filter rexglue.exe -Recurse | Select-Object -First 1
-          if (-not $rexglue) {
-            throw "rexglue.exe was not found in the SDK package."
-          }
+          $rexglue = Get-ChildItem $sdk -Filter 'rexglue.exe' -Recurse | Select-Object -First 1
+          $config = Get-ChildItem $sdk -Filter 'rexglueConfig.cmake' -Recurse | Select-Object -First 1
+          if (-not $rexglue) { throw 'rexglue.exe was not found in the SDK package.' }
+          if (-not $config) { throw 'rexglueConfig.cmake was not found in the SDK package.' }
 
-          "REXGLUE_EXE=$($rexglue.FullName)" >> $env:GITHUB_ENV
-          "CMAKE_PREFIX_PATH=$sdk" >> $env:GITHUB_ENV
-          "$($rexglue.Directory.FullName)" >> $env:GITHUB_PATH
+          $prefix = (Get-Item (Join-Path $config.Directory.FullName '..\..\..')).FullName
+          "REXGLUE_EXE=$($rexglue.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CMAKE_PREFIX_PATH=$prefix" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $rexglue.Directory.FullName | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
 
-      - name: Prepare LARecomp generated SDK files
+          & $rexglue.FullName --version
+          if ($LASTEXITCODE -ne 0) { throw 'ReXGlue executable did not start correctly.' }
+
+      - name: Generate LARecomp SDK CMake glue
         shell: pwsh
         run: |
-          & "$env:REXGLUE_EXE" migrate --app_root "$PWD" --force
-          if (-not (Test-Path "generated\rexglue.cmake")) {
-            throw "generated/rexglue.cmake was not created."
-          }
+          New-Item -ItemType Directory -Force -Path generated | Out-Null
+          @'
+# Auto-generated for the LARecomp cloud build.
+set(REXSDK_VERSION "0.10.0" CACHE STRING "Override SDK version")
+set(REXSDK_DIR "" CACHE PATH "Path to rexglue-sdk source tree")
+if(REXSDK_DIR)
+    add_subdirectory("${REXSDK_DIR}" rexglue-sdk)
+else()
+    find_package(rexglue ${REXSDK_VERSION} EXACT QUIET CONFIG)
+    if(NOT rexglue_FOUND)
+        message(FATAL_ERROR "ReXGlue SDK 0.10.0 not found. Set CMAKE_PREFIX_PATH to its install prefix.")
+    endif()
+endif()
+
+if(NOT DEFINED REXGLUE_HOST_TARGET)
+    set(REXGLUE_HOST_TARGET larecomp)
+endif()
+
+set(REXGLUE_RECOMP_DEBUG_INFO "line-tables-only" CACHE STRING "Debug info level")
+set(REXGLUE_RECOMP_OPTIONS "")
+if(WIN32)
+    if(MSVC)
+        list(APPEND REXGLUE_RECOMP_OPTIONS /EHa)
+    elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        list(APPEND REXGLUE_RECOMP_OPTIONS -fasync-exceptions)
+    endif()
+endif()
+if(REXGLUE_RECOMP_DEBUG_INFO STREQUAL "none")
+    list(APPEND REXGLUE_RECOMP_OPTIONS $<$<CXX_COMPILER_ID:Clang,AppleClang,GNU>:-g0>)
+elseif(REXGLUE_RECOMP_DEBUG_INFO STREQUAL "line-tables-only")
+    list(APPEND REXGLUE_RECOMP_OPTIONS $<$<CXX_COMPILER_ID:Clang,AppleClang>:-gline-tables-only>)
+endif()
+
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/generated/sources.cmake")
+    include(generated/sources.cmake)
+    set(REXGLUE_ENTRYPOINT_GENERATED_SOURCES ${GENERATED_SOURCES})
+    set(REXGLUE_ENTRYPOINT_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/generated")
+    set_source_files_properties(${REXGLUE_ENTRYPOINT_GENERATED_SOURCES} PROPERTIES COMPILE_OPTIONS "${REXGLUE_RECOMP_OPTIONS}")
+endif()
+
+function(rexglue_apply_recomp_settings target_name pch_header)
+    target_precompile_headers(${target_name} PRIVATE "${pch_header}")
+    target_compile_options(${target_name} PRIVATE ${REXGLUE_RECOMP_OPTIONS})
+endfunction()
+
+macro(rexglue_setup_target target_name)
+    if(REXGLUE_ENTRYPOINT_GENERATED_SOURCES)
+        add_library(${target_name}_recomp OBJECT ${REXGLUE_ENTRYPOINT_GENERATED_SOURCES})
+        target_include_directories(${target_name}_recomp PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${REXGLUE_ENTRYPOINT_INCLUDE_DIR})
+        target_link_libraries(${target_name}_recomp PRIVATE rex::runtime)
+        rexglue_apply_target_settings(${target_name}_recomp)
+        rexglue_apply_recomp_settings(${target_name}_recomp
+            "${REXGLUE_ENTRYPOINT_INCLUDE_DIR}/larecomp_pch.h")
+        target_link_libraries(${target_name} PRIVATE ${target_name}_recomp)
+    endif()
+    target_include_directories(${target_name} PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${REXGLUE_ENTRYPOINT_INCLUDE_DIR})
+    target_link_libraries(${target_name} PRIVATE rex::runtime)
+    rexglue_configure_target(${target_name} ${ARGN})
+endmacro()
+']@ | Set-Content -Path generated/rexglue.cmake -Encoding utf8
 
       - name: Download your own game XEX
         shell: pwsh
         env:
-          GH_TOKEN: \${{ secrets.GAME_DATA_TOKEN }}
+          GH_TOKEN: ${{ secrets.GAME_DATA_TOKEN }}
         run: |
-          if (-not $env:GH_TOKEN) {
-            throw "Missing GAME_DATA_TOKEN. Create the private game-data repository and add a read-only token as a repository secret."
-          }
-
+          if (-not $env:GH_TOKEN) { throw 'Missing GAME_DATA_TOKEN secret.' }
           New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\game-input" | Out-Null
-
-          gh release download mcla --repo eleduyo/MCLA-GameData --pattern "default.xex" --dir "$env:RUNNER_TEMP\game-input"
-
-          if (-not (Test-Path "$env:RUNNER_TEMP\game-input\default.xex")) {
-            throw "default.xex was not downloaded."
-          }
+          gh release download mcla --repo eleduyo/MCLA-GameData --pattern 'default.xex' --dir "$env:RUNNER_TEMP\game-input"
+          if (-not (Test-Path "$env:RUNNER_TEMP\game-input\default.xex")) { throw 'default.xex was not downloaded.' }
 
       - name: Run LARecomp codegen
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path "out\build\win-amd64-release\assets" | Out-Null
-          Copy-Item "$env:RUNNER_TEMP\game-input\default.xex" "out\build\win-amd64-release\assets\default.xex" -Force
-
-          & "$env:REXGLUE_EXE" codegen larecomp_manifest.toml
-
-          if (-not (Test-Path "generated\sources.cmake")) {
-            throw "Codegen did not create generated/sources.cmake."
-          }
+          New-Item -ItemType Directory -Force -Path 'out\build\win-amd64-release\assets' | Out-Null
+          Copy-Item "$env:RUNNER_TEMP\game-input\default.xex" 'out\build\win-amd64-release\assets\default.xex' -Force
+          & $env:REXGLUE_EXE codegen larecomp_manifest.toml
+          if ($LASTEXITCODE -ne 0) { throw 'LARecomp codegen failed.' }
+          if (-not (Test-Path 'generated\sources.cmake')) { throw 'Codegen did not create generated/sources.cmake.' }
 
       - name: Configure LARecomp
         shell: pwsh
         run: |
-          cmake --preset win-amd64-release -DCMAKE_PREFIX_PATH="$env:CMAKE_PREFIX_PATH"
+          cmake --preset win-amd64-release -DCMAKE_PREFIX_PATH="$env:CMAKE_PREFIX_PATH" -DCMAKE_CXX_FLAGS='-march=x86-64-v2'
 
       - name: Build LARecomp
         shell: pwsh
         run: |
-          cmake --build out/build/win-amd64-release
+          cmake --build out/build/win-amd64-release --parallel
+          if ($LASTEXITCODE -ne 0) { throw 'LARecomp build failed.' }
 
       - name: Package LARecomp
         shell: pwsh
         run: |
-          Compress-Archive -Path "out\build\win-amd64-release\*" -DestinationPath "$env:RUNNER_TEMP\LARecomp-win64.zip" -Force
+          Compress-Archive -Path 'out\build\win-amd64-release\*' -DestinationPath "$env:RUNNER_TEMP\LARecomp-win64.zip" -Force
 
       - name: Upload LARecomp
         uses: actions/upload-artifact@v4
         with:
           name: LARecomp-win64
-          path: \${{ runner.temp }}/LARecomp-win64.zip
+          path: ${{ runner.temp }}/LARecomp-win64.zip
           if-no-files-found: error
