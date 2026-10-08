@@ -30,6 +30,7 @@ jobs:
           $url = 'https://github.com/rexglue/rexglue-sdk/releases/download/v0.10.0/rexglue-sdk-0.10.0-win-amd64.zip'
           $zip = Join-Path $env:RUNNER_TEMP 'rexglue-sdk.zip'
           $sdk = Join-Path $env:RUNNER_TEMP 'rexglue-sdk'
+
           Invoke-WebRequest -Uri $url -OutFile $zip
 
           $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
@@ -54,19 +55,6 @@ jobs:
 
           & $rexglue.FullName --version
 
-      - name: Generate ReXGlue project files
-        shell: pwsh
-        run: |
-          & $env:REXGLUE_EXE migrate --app_root "$PWD" --force
-
-          if ($LASTEXITCODE -ne 0) {
-            throw 'ReXGlue migrate failed.'
-          }
-
-          if (-not (Test-Path 'generated\rexglue.cmake')) {
-            throw 'generated/rexglue.cmake was not created.'
-          }
-
       - name: Download your own game XEX
         shell: pwsh
         env:
@@ -85,11 +73,36 @@ jobs:
             throw 'default.xex was not downloaded.'
           }
 
+      - name: Generate ReXGlue CMake integration
+        shell: pwsh
+        run: |
+          $templateRoot = Join-Path $env:RUNNER_TEMP 'rexglue-template'
+          $xex = Join-Path $env:RUNNER_TEMP 'game-input\default.xex'
+
+          Remove-Item $templateRoot -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $templateRoot | Out-Null
+
+          & $env:REXGLUE_EXE init --project-name larecomp --xex-path $xex --project-root $templateRoot --force
+
+          if ($LASTEXITCODE -ne 0) {
+            throw 'ReXGlue init failed.'
+          }
+
+          $generated = Join-Path $templateRoot 'generated\rexglue.cmake'
+
+          if (-not (Test-Path $generated)) {
+            throw 'ReXGlue init did not create generated/rexglue.cmake.'
+          }
+
+          New-Item -ItemType Directory -Force -Path generated | Out-Null
+          Copy-Item $generated 'generated\rexglue.cmake' -Force
+
       - name: Prepare XEX for codegen
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path 'out\build\win-amd64-release\assets' | Out-Null
-          Copy-Item "$env:RUNNER_TEMP\game-input\default.xex" 'out\build\win-amd64-release\assets\default.xex' -Force
+          $assetDir = 'out\build\win-amd64-release\assets'
+          New-Item -ItemType Directory -Force -Path $assetDir | Out-Null
+          Copy-Item "$env:RUNNER_TEMP\game-input\default.xex" (Join-Path $assetDir 'default.xex') -Force
 
       - name: Run LARecomp codegen
         shell: pwsh
